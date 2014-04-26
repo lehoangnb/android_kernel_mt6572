@@ -1032,6 +1032,7 @@ static void __queue_work(unsigned int cpu, struct workqueue_struct *wq,
 	cwq = get_cwq(gcwq->cpu, wq);
 	trace_workqueue_queue_work(cpu, cwq, work);
 
+
 	BUG_ON(!list_empty(&work->entry));
 
 	cwq->nr_in_flight[cwq->work_color]++;
@@ -1065,6 +1066,10 @@ int queue_work(struct workqueue_struct *wq, struct work_struct *work)
 {
 	int ret;
 
+  
+    /*get caller's caller address*/
+    //work->caller_address = __builtin_return_address(1);
+    
 	ret = queue_work_on(get_cpu(), wq, work);
 	put_cpu();
 
@@ -1210,13 +1215,8 @@ static void worker_enter_idle(struct worker *worker)
 	} else
 		wake_up_all(&gcwq->trustee_wait);
 
-	/*
-	 * Sanity check nr_running.  Because trustee releases gcwq->lock
-	 * between setting %WORKER_ROGUE and zapping nr_running, the
-	 * warning may trigger spuriously.  Check iff trustee is idle.
-	 */
-	WARN_ON_ONCE(gcwq->trustee_state == TRUSTEE_DONE &&
-		     gcwq->nr_workers == gcwq->nr_idle &&
+	/* sanity check nr_running */
+	WARN_ON_ONCE(gcwq->nr_workers == gcwq->nr_idle &&
 		     atomic_read(get_gcwq_nr_running(gcwq->cpu)));
 }
 
@@ -1728,6 +1728,7 @@ static void cwq_activate_first_delayed(struct cpu_workqueue_struct *cwq)
 	struct list_head *pos = gcwq_determine_ins_pos(cwq->gcwq, cwq);
 
 	trace_workqueue_activate_work(work);
+
 	move_linked_works(work, pos, NULL);
 	__clear_bit(WORK_STRUCT_DELAYED_BIT, work_data_bits(work));
 	cwq->nr_active++;
@@ -1796,6 +1797,7 @@ static void cwq_dec_nr_in_flight(struct cpu_workqueue_struct *cwq, int color,
  * CONTEXT:
  * spin_lock_irq(gcwq->lock) which is released and regrabbed.
  */
+static struct work_struct *his_work_dbg;
 static void process_one_work(struct worker *worker, struct work_struct *work)
 __releases(&gcwq->lock)
 __acquires(&gcwq->lock)
@@ -1817,6 +1819,10 @@ __acquires(&gcwq->lock)
 	 */
 	struct lockdep_map lockdep_map = work->lockdep_map;
 #endif
+   
+    /*record the last work and get the caller address*/
+    his_work_dbg = work;
+    
 	/*
 	 * A single work shouldn't be executed concurrently by
 	 * multiple workers on a single cpu.  Check whether anyone is
@@ -3685,7 +3691,7 @@ void freeze_workqueues_begin(void)
  * %true if some freezable workqueues are still busy.  %false if freezing
  * is complete.
  */
-bool freeze_workqueues_busy(void)
+bool freeze_workqueues_busy(bool log)
 {
 	unsigned int cpu;
 	bool busy = false;
@@ -3708,6 +3714,7 @@ bool freeze_workqueues_busy(void)
 
 			BUG_ON(cwq->nr_active < 0);
 			if (cwq->nr_active) {
+				if (log) printk("\t->busy wq:%s\n",cwq->wq->name);
 				busy = true;
 				goto out_unlock;
 			}

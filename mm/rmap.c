@@ -844,7 +844,8 @@ static int page_referenced_file(struct page *page,
 	 */
 	BUG_ON(!PageLocked(page));
 
-	mutex_lock(&mapping->i_mmap_mutex);
+	//mutex_lock(&mapping->i_mmap_mutex);
+	if (!mutex_trylock(&mapping->i_mmap_mutex)) return 1;
 
 	/*
 	 * i_mmap_mutex does not stabilize mapcount at all, but mapcount

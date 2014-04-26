@@ -20,6 +20,16 @@
 
 #define raw_smp_processor_id() (current_thread_info()->cpu)
 
+enum ipi_msg_type {
+	IPI_CPU_START = 1,
+	IPI_TIMER = 2,
+	IPI_RESCHEDULE,
+	IPI_CALL_FUNC,
+	IPI_CALL_FUNC_SINGLE,
+	IPI_CPU_STOP,
+	IPI_CPU_BACKTRACE,
+};
+
 struct seq_file;
 
 /*
@@ -92,5 +102,7 @@ extern void platform_cpu_enable(unsigned int cpu);
 
 extern void arch_send_call_function_single_ipi(int cpu);
 extern void arch_send_call_function_ipi_mask(const struct cpumask *mask);
+
+extern void smp_send_all_cpu_backtrace(void);
 
 #endif /* ifndef __ASM_ARM_SMP_H */

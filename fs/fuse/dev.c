@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "fuse.h"
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -16,9 +17,11 @@
 #include <linux/pagemap.h>
 #include <linux/file.h>
 #include <linux/slab.h>
+#include <linux/freezer.h>
 #include <linux/pipe_fs_i.h>
 #include <linux/swap.h>
 #include <linux/splice.h>
+#include <linux/freezer.h>
 
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 MODULE_ALIAS("devname:fuse");
@@ -387,7 +390,10 @@ __acquires(fc->lock)
 	 * Wait it out.
 	 */
 	spin_unlock(&fc->lock);
-	wait_event(req->waitq, req->state == FUSE_REQ_FINISHED);
+
+	while (req->state != FUSE_REQ_FINISHED)
+		wait_event_freezable(req->waitq,
+				     req->state == FUSE_REQ_FINISHED);
 	spin_lock(&fc->lock);
 
 	if (!req->aborted)
@@ -1107,6 +1113,8 @@ static ssize_t fuse_dev_do_read(struct fuse_conn *fc, struct file *file,
 	struct fuse_in *in;
 	unsigned reqsize;
 
+	FUSE_MIGHT_FREEZE(file->f_mapping->host->i_sb, "fuse_dev_read");
+
  restart:
 	spin_lock(&fc->lock);
 	err = -EAGAIN;
@@ -1802,6 +1810,9 @@ static ssize_t fuse_dev_write(struct kiocb *iocb, const struct iovec *iov,
 	struct fuse_conn *fc = fuse_get_conn(iocb->ki_filp);
 	if (!fc)
 		return -EPERM;
+
+	FUSE_MIGHT_FREEZE(iocb->ki_filp->f_mapping->host->i_sb,
+			"fuse_dev_write");
 
 	fuse_copy_init(&cs, fc, 0, iov, nr_segs);
 

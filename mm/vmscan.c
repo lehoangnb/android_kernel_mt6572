@@ -42,6 +42,9 @@
 #include <linux/sysctl.h>
 #include <linux/oom.h>
 #include <linux/prefetch.h>
+//Google Patch
+//https://android.googlesource.com/kernel/common/+/29b8a347fcba8a7df5478f746f1d2a422e294190%5E%21/#F0
+#include <linux/debugfs.h>
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -154,6 +157,7 @@ struct mem_cgroup_zone {
  * From 0 .. 100.  Higher means more swappy.
  */
 int vm_swappiness = 60;
+EXPORT_SYMBOL(vm_swappiness);
 long vm_total_pages;	/* The total number of pages which the VM controls */
 
 static LIST_HEAD(shrinker_list);
@@ -200,6 +204,42 @@ static unsigned long zone_nr_lru_pages(struct mem_cgroup_zone *mz,
 
 	return zone_page_state(mz->zone, NR_LRU_BASE + lru);
 }
+//Google Patch
+//https://android.googlesource.com/kernel/common/+/29b8a347fcba8a7df5478f746f1d2a422e294190%5E%21/#F0
+struct dentry *debug_file;
+
+static int debug_shrinker_show(struct seq_file *s, void *unused)
+{
+	struct shrinker *shrinker;
+	struct shrink_control sc;
+
+	sc.gfp_mask = -1;
+	sc.nr_to_scan = 0;
+
+	down_read(&shrinker_rwsem);
+	list_for_each_entry(shrinker, &shrinker_list, list) {
+		//char name[64];
+		int num_objs;
+
+		num_objs = shrinker->shrink(shrinker, &sc);
+		seq_printf(s, "%pf %d\n", shrinker->shrink, num_objs);
+	}
+	up_read(&shrinker_rwsem);
+	return 0;
+}
+
+static int debug_shrinker_open(struct inode *inode, struct file *file)
+{
+        return single_open(file, debug_shrinker_show, inode->i_private);
+}
+
+static const struct file_operations debug_shrinker_fops = {
+        .open = debug_shrinker_open,
+        .read = seq_read,
+        .llseek = seq_lseek,
+        .release = single_release,
+};
+
 
 
 /*
@@ -213,6 +253,19 @@ void register_shrinker(struct shrinker *shrinker)
 	up_write(&shrinker_rwsem);
 }
 EXPORT_SYMBOL(register_shrinker);
+
+//Google Patch
+//https://android.googlesource.com/kernel/common/+/29b8a347fcba8a7df5478f746f1d2a422e294190%5E%21/#F0
+
+static int __init add_shrinker_debug(void)
+{
+	debugfs_create_file("shrinker", 0644, NULL, NULL,
+			    &debug_shrinker_fops);
+	return 0;
+}
+
+late_initcall(add_shrinker_debug);
+
 
 /*
  * Remove one
@@ -374,10 +427,15 @@ static void set_reclaim_mode(int priority, struct scan_control *sc,
 	 * reclaim/compaction.Depending on the order, we will either set the
 	 * sync mode or just reclaim order-0 pages later.
 	 */
+#ifdef CONFIG_ZRAM
+	// disable lumpy reclaim, see kernel patch: mm: vmscan: remove lumpy reclaim
+	sc->reclaim_mode = 0;
+#else
 	if (COMPACTION_BUILD)
 		sc->reclaim_mode = RECLAIM_MODE_COMPACTION;
 	else
 		sc->reclaim_mode = RECLAIM_MODE_LUMPYRECLAIM;
+#endif
 
 	/*
 	 * Avoid using lumpy reclaim or reclaim/compaction if possible by
@@ -722,7 +780,7 @@ static enum page_references page_check_references(struct page *page,
 		return PAGEREF_RECLAIM;
 
 	if (referenced_ptes) {
-		if (PageSwapBacked(page))
+		if (PageAnon(page))
 			return PAGEREF_ACTIVATE;
 		/*
 		 * All mapped pages start out with page table
@@ -1339,7 +1397,7 @@ static int too_many_isolated(struct zone *zone, int file,
 {
 	unsigned long inactive, isolated;
 
-	if (current_is_kswapd())
+	if (current_is_kswapd() || sc->hibernation_mode)
 		return 0;
 
 	if (!global_reclaim(sc))
@@ -1872,7 +1930,7 @@ static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
 	int file = is_file_lru(lru);
 
 	if (is_active_lru(lru)) {
-		if (inactive_list_is_low(mz, file))
+		if (sc->hibernation_mode || inactive_list_is_low(mz, file))
 			shrink_active_list(nr_to_scan, mz, sc, priority, file);
 		return 0;
 	}
@@ -1887,6 +1945,27 @@ static int vmscan_swappiness(struct mem_cgroup_zone *mz,
 		return vm_swappiness;
 	return mem_cgroup_swappiness(mz->mem_cgroup);
 }
+
+#ifdef CONFIG_ZRAM
+// vmscan debug
+static int vmscan_swap_sum = 200;
+static int vmscan_swap_file_ratio = 1;
+module_param_named(swap_sum, vmscan_swap_sum, int, S_IRUGO | S_IWUSR);
+module_param_named(swap_file_ratio, vmscan_swap_file_ratio, int, S_IRUGO | S_IWUSR);
+
+static int vmscan_scan_file_sum = 0;
+static int vmscan_scan_anon_sum = 0;
+static int vmscan_recent_scanned_anon = 0;
+static int vmscan_recent_scanned_file = 0;
+static int vmscan_recent_rotated_anon = 0;
+static int vmscan_recent_rotated_file = 0;
+module_param_named(scan_file_sum, vmscan_scan_file_sum, int, S_IRUGO);
+module_param_named(scan_anon_sum, vmscan_scan_anon_sum, int, S_IRUGO);
+module_param_named(recent_scanned_anon, vmscan_recent_scanned_anon, int, S_IRUGO);
+module_param_named(recent_scanned_file, vmscan_recent_scanned_file, int, S_IRUGO);
+module_param_named(recent_rotated_anon, vmscan_recent_rotated_anon, int, S_IRUGO);
+module_param_named(recent_rotated_file, vmscan_recent_rotated_file, int, S_IRUGO);
+#endif // CONFIG_ZRAM
 
 /*
  * Determine how aggressively the anon and file LRU lists should be
@@ -1953,8 +2032,18 @@ static void get_scan_count(struct mem_cgroup_zone *mz, struct scan_control *sc,
 	 * With swappiness at 100, anonymous and file have the same priority.
 	 * This scanning priority is essentially the inverse of IO cost.
 	 */
+#ifdef CONFIG_ZRAM
+	if (vmscan_swap_file_ratio) {
+	    anon_prio = (vmscan_swappiness(mz, sc) * anon) / (anon + file + 1);
+	    file_prio = (vmscan_swap_sum - vmscan_swappiness(mz, sc)) * file / (anon + file + 1);
+	} else {
+	    anon_prio = vmscan_swappiness(mz, sc);
+	    file_prio = vmscan_swap_sum - vmscan_swappiness(mz, sc);
+	}
+#else // CONFIG_ZRAM
 	anon_prio = vmscan_swappiness(mz, sc);
 	file_prio = 200 - vmscan_swappiness(mz, sc);
+#endif // CONFIG_ZRAM
 
 	/*
 	 * OK, so we have swap space and a fair amount of page cache
@@ -1984,10 +2073,10 @@ static void get_scan_count(struct mem_cgroup_zone *mz, struct scan_control *sc,
 	 * each list that were recently referenced and in active use.
 	 */
 	ap = (anon_prio + 1) * (reclaim_stat->recent_scanned[0] + 1);
-	ap /= reclaim_stat->recent_rotated[0] + 1;
-
 	fp = (file_prio + 1) * (reclaim_stat->recent_scanned[1] + 1);
-	fp /= reclaim_stat->recent_rotated[1] + 1;
+        ap /= reclaim_stat->recent_rotated[0] + 1;
+        fp /= reclaim_stat->recent_rotated[1] + 1;
+
 	spin_unlock_irq(&mz->zone->lru_lock);
 
 	fraction[0] = ap;
@@ -1999,7 +2088,7 @@ out:
 		unsigned long scan;
 
 		scan = zone_nr_lru_pages(mz, lru);
-		if (priority || noswap) {
+		if ((priority || noswap) && !sc->hibernation_mode) {
 			scan >>= priority;
 			if (!scan && force_scan)
 				scan = SWAP_CLUSTER_MAX;
@@ -2007,6 +2096,14 @@ out:
 		}
 		nr[lru] = scan;
 	}
+#ifdef CONFIG_ZRAM
+        vmscan_recent_scanned_anon = reclaim_stat->recent_scanned[0];
+        vmscan_recent_scanned_file = reclaim_stat->recent_scanned[1];
+        vmscan_recent_rotated_anon = reclaim_stat->recent_rotated[0];
+        vmscan_recent_rotated_file = reclaim_stat->recent_rotated[1];
+        vmscan_scan_anon_sum += nr[LRU_INACTIVE_ANON];
+        vmscan_scan_file_sum += nr[LRU_INACTIVE_FILE];
+#endif // CONFIG_ZRAM
 }
 
 /*
@@ -2023,6 +2120,9 @@ static inline bool should_continue_reclaim(struct mem_cgroup_zone *mz,
 {
 	unsigned long pages_for_compaction;
 	unsigned long inactive_lru_pages;
+
+	if (sc->hibernation_mode && nr_reclaimed && nr_scanned && sc->nr_to_reclaim >= sc->nr_reclaimed)
+		return true;
 
 	/* If not in reclaim/compaction mode, stop */
 	if (!(sc->reclaim_mode & RECLAIM_MODE_COMPACTION))
@@ -2122,7 +2222,7 @@ restart:
 	 * Even if we did not try to evict anon pages at all, we want to
 	 * rebalance the anon lru active/inactive ratio.
 	 */
-	if (inactive_anon_is_low(mz))
+	if (sc->hibernation_mode || inactive_anon_is_low(mz))
 		shrink_active_list(SWAP_CLUSTER_MAX, mz, sc, priority, 0);
 
 	/* reclaim/compaction might need reclaim to continue */
@@ -2256,7 +2356,7 @@ static bool shrink_zones(int priority, struct zonelist *zonelist,
 				continue;
 			if (zone->all_unreclaimable && priority != DEF_PRIORITY)
 				continue;	/* Let kswapd poll it */
-			if (COMPACTION_BUILD) {
+			if (COMPACTION_BUILD && !sc->hibernation_mode) {
 				/*
 				 * If we already have plenty of memory free for
 				 * compaction in this zone, don't free any more.
@@ -2344,6 +2444,11 @@ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
 	struct zone *zone;
 	unsigned long writeback_threshold;
 	bool aborted_reclaim;
+
+#ifdef CONFIG_FREEZER
+	if (unlikely(pm_freezing && !sc->hibernation_mode))
+		return 0;
+#endif
 
 	delayacct_freepages_start();
 
@@ -3138,6 +3243,11 @@ void wakeup_kswapd(struct zone *zone, int order, enum zone_type classzone_idx)
 	if (!populated_zone(zone))
 		return;
 
+#ifdef CONFIG_FREEZER
+	if (pm_freezing)
+		return;
+#endif
+
 	if (!cpuset_zone_allowed_hardwall(zone, GFP_KERNEL))
 		return;
 	pgdat = zone->zone_pgdat;
@@ -3198,11 +3308,11 @@ unsigned long zone_reclaimable_pages(struct zone *zone)
  * LRU order by reclaiming preferentially
  * inactive > active > active referenced > active mapped
  */
-unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
+unsigned long shrink_memory_mask(unsigned long nr_to_reclaim, gfp_t mask)
 {
 	struct reclaim_state reclaim_state;
 	struct scan_control sc = {
-		.gfp_mask = GFP_HIGHUSER_MOVABLE,
+		.gfp_mask = mask,
 		.may_swap = 1,
 		.may_unmap = 1,
 		.may_writepage = 1,
@@ -3230,6 +3340,13 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
 
 	return nr_reclaimed;
 }
+EXPORT_SYMBOL_GPL(shrink_memory_mask);
+
+unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
+{
+	return shrink_memory_mask(nr_to_reclaim, GFP_HIGHUSER_MOVABLE);
+}
+EXPORT_SYMBOL_GPL(shrink_all_memory);
 #endif /* CONFIG_HIBERNATION */
 
 /* It's optimal to keep kswapds on the same CPUs as their memory, but
@@ -3278,6 +3395,11 @@ int kswapd_run(int nid)
 	return ret;
 }
 
+        /*
+         * kernel patch
+         * commit: 0e343dbe08acb440f7914d989bcc32c1d1576735
+         * https://android.googlesource.com/kernel/common/+/0e343dbe08acb440f7914d989bcc32c1d1576735%5E!/#F0
+         */
 /*
  * Called by memory hotplug when all memory in a node is offlined.  Caller must
  * hold lock_memory_hotplug().
@@ -3286,6 +3408,8 @@ void kswapd_stop(int nid)
 {
 	struct task_struct *kswapd = NODE_DATA(nid)->kswapd;
 
+	//if (kswapd)
+	//	kthread_stop(kswapd);
 	if (kswapd) {
 		kthread_stop(kswapd);
 		NODE_DATA(nid)->kswapd = NULL;

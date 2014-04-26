@@ -563,11 +563,25 @@ static void __init *early_alloc(unsigned long sz)
 	return early_alloc_aligned(sz, sz);
 }
 
-static pte_t * __init early_pte_alloc(pmd_t *pmd, unsigned long addr, unsigned long prot)
+static pte_t * __init early_pte_alloc(pmd_t *pmd)
+{
+	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		return early_alloc(PTE_HWTABLE_OFF + PTE_HWTABLE_SIZE);
+	return pmd_page_vaddr(*pmd);
+}
+
+static void __init early_pte_install(pmd_t *pmd, pte_t *pte, unsigned long prot)
+{
+	__pmd_populate(pmd, __pa(pte), prot);
+	BUG_ON(pmd_bad(*pmd));
+}
+
+static pte_t * __init early_pte_alloc_and_install(pmd_t *pmd,
+	unsigned long addr, unsigned long prot)
 {
 	if (pmd_none(*pmd)) {
-		pte_t *pte = early_alloc(PTE_HWTABLE_OFF + PTE_HWTABLE_SIZE);
-		__pmd_populate(pmd, __pa(pte), prot);
+		pte_t *pte = early_pte_alloc(pmd);
+		early_pte_install(pmd, pte, prot);
 	}
 	BUG_ON(pmd_bad(*pmd));
 	return pte_offset_kernel(pmd, addr);
@@ -577,16 +591,23 @@ static void __init alloc_init_pte(pmd_t *pmd, unsigned long addr,
 				  unsigned long end, unsigned long pfn,
 				  const struct mem_type *type)
 {
-	pte_t *pte = early_pte_alloc(pmd, addr, type->prot_l1);
+	pte_t *start_pte = early_pte_alloc(pmd);
+	pte_t *pte = start_pte + pte_index(addr);
+
+	/* If replacing a section mapping, the whole section must be replaced */
+	BUG_ON(pmd_bad(*pmd) && ((addr | end) & ~PMD_MASK));
+
 	do {
 		set_pte_ext(pte, pfn_pte(pfn, __pgprot(type->prot_pte)), 0);
 		pfn++;
 	} while (pte++, addr += PAGE_SIZE, addr != end);
+	early_pte_install(pmd, start_pte, type->prot_l1);
 }
 
 static void __init alloc_init_section(pud_t *pud, unsigned long addr,
 				      unsigned long end, phys_addr_t phys,
-				      const struct mem_type *type)
+				      const struct mem_type *type,
+				      bool force_pages)
 {
 	pmd_t *pmd = pmd_offset(pud, addr);
 
@@ -596,7 +617,7 @@ static void __init alloc_init_section(pud_t *pud, unsigned long addr,
 	 * L1 entries, whereas PGDs refer to a group of L1 entries making
 	 * up one logical pointer to an L2 table.
 	 */
-	if (((addr | end | phys) & ~SECTION_MASK) == 0) {
+	if (((addr | end | phys) & ~SECTION_MASK) == 0 && !force_pages) {
 		pmd_t *p = pmd;
 
 #ifndef CONFIG_ARM_LPAE
@@ -620,14 +641,15 @@ static void __init alloc_init_section(pud_t *pud, unsigned long addr,
 }
 
 static void __init alloc_init_pud(pgd_t *pgd, unsigned long addr,
-	unsigned long end, unsigned long phys, const struct mem_type *type)
+	unsigned long end, unsigned long phys, const struct mem_type *type,
+	bool force_pages)
 {
 	pud_t *pud = pud_offset(pgd, addr);
 	unsigned long next;
 
 	do {
 		next = pud_addr_end(addr, end);
-		alloc_init_section(pud, addr, next, phys, type);
+		alloc_init_section(pud, addr, next, phys, type, force_pages);
 		phys += next - addr;
 	} while (pud++, addr = next, addr != end);
 }
@@ -701,7 +723,7 @@ static void __init create_36bit_mapping(struct map_desc *md,
  * offsets, and we take full advantage of sections and
  * supersections.
  */
-static void __init create_mapping(struct map_desc *md)
+static void __init create_mapping(struct map_desc *md, bool force_pages)
 {
 	unsigned long addr, length, end;
 	phys_addr_t phys;
@@ -751,7 +773,7 @@ static void __init create_mapping(struct map_desc *md)
 	do {
 		unsigned long next = pgd_addr_end(addr, end);
 
-		alloc_init_pud(pgd, addr, next, phys, type);
+		alloc_init_pud(pgd, addr, next, phys, type, force_pages);
 
 		phys += next - addr;
 		addr = next;
@@ -772,7 +794,7 @@ void __init iotable_init(struct map_desc *io_desc, int nr)
 	vm = early_alloc_aligned(sizeof(*vm) * nr, __alignof__(*vm));
 
 	for (md = io_desc; nr; md++, nr--) {
-		create_mapping(md);
+		create_mapping(md, false);
 		vm->addr = (void *)(md->virtual & PAGE_MASK);
 		vm->size = PAGE_ALIGN(md->length + (md->virtual & ~PAGE_MASK));
 		vm->phys_addr = __pfn_to_phys(md->pfn); 
@@ -782,6 +804,9 @@ void __init iotable_init(struct map_desc *io_desc, int nr)
 		vm_area_add_early(vm++);
 	}
 }
+
+//Update Patch from Google
+//https://android.googlesource.com/kernel/common/+/937bff779cd840aca9f74dd7f2d43dafad3979bb%5E..937bff779cd840aca9f74dd7f2d43dafad3979bb/#F0
 
 #ifndef CONFIG_ARM_LPAE
 
@@ -855,6 +880,7 @@ static void __init fill_pmd_gaps(void)
 #else
 #define fill_pmd_gaps() do { } while (0)
 #endif
+
 
 static void * __initdata vmalloc_min =
 	(void *)(VMALLOC_END - (240 << 20) - VMALLOC_OFFSET);
@@ -1124,12 +1150,12 @@ static void __init devicemaps_init(struct machine_desc *mdesc)
 	map.virtual = 0xffff0000;
 	map.length = PAGE_SIZE;
 	map.type = MT_HIGH_VECTORS;
-	create_mapping(&map);
+	create_mapping(&map, false);
 
 	if (!vectors_high()) {
 		map.virtual = 0;
 		map.type = MT_LOW_VECTORS;
-		create_mapping(&map);
+		create_mapping(&map, false);
 	}
 
 	/*
@@ -1137,7 +1163,9 @@ static void __init devicemaps_init(struct machine_desc *mdesc)
 	 */
 	if (mdesc->map_io)
 		mdesc->map_io();
-	fill_pmd_gaps();
+        //Update Patch from Google
+        //https://android.googlesource.com/kernel/common/+/937bff779cd840aca9f74dd7f2d43dafad3979bb%5E..937bff779cd840aca9f74dd7f2d43dafad3979bb/#F0
+        fill_pmd_gaps();
 
 	/*
 	 * Finally flush the caches and tlb to ensure that we're in a
@@ -1152,20 +1180,23 @@ static void __init devicemaps_init(struct machine_desc *mdesc)
 static void __init kmap_init(void)
 {
 #ifdef CONFIG_HIGHMEM
-	pkmap_page_table = early_pte_alloc(pmd_off_k(PKMAP_BASE),
+	pkmap_page_table = early_pte_alloc_and_install(pmd_off_k(PKMAP_BASE),
 		PKMAP_BASE, _PAGE_KERNEL_TABLE);
 #endif
 }
 
+
 static void __init map_lowmem(void)
 {
 	struct memblock_region *reg;
+	phys_addr_t start;
+	phys_addr_t end;
+	struct map_desc map;
 
 	/* Map all the lowmem memory banks. */
 	for_each_memblock(memory, reg) {
-		phys_addr_t start = reg->base;
-		phys_addr_t end = start + reg->size;
-		struct map_desc map;
+		start = reg->base;
+		end = start + reg->size;
 
 		if (end > lowmem_limit)
 			end = lowmem_limit;
@@ -1177,8 +1208,24 @@ static void __init map_lowmem(void)
 		map.length = end - start;
 		map.type = MT_MEMORY;
 
-		create_mapping(&map);
+                printk(KERN_ALERT"creating mapping start pfn: %ld @ 0x%08lx "
+                        ", end: %ld @ 0x%08lx\n",
+                        map.pfn, map.virtual,
+                       __phys_to_pfn(end), __phys_to_virt(end));
+		create_mapping(&map, false);
 	}
+
+#ifdef CONFIG_DEBUG_RODATA
+	start = __pa(_stext) & PMD_MASK;
+	end = ALIGN(__pa(__end_rodata), PMD_SIZE);
+
+	map.pfn = __phys_to_pfn(start);
+	map.virtual = __phys_to_virt(start);
+	map.length = end - start;
+	map.type = MT_MEMORY;
+
+	create_mapping(&map, true);
+#endif
 }
 
 /*
@@ -1207,3 +1254,89 @@ void __init paging_init(struct machine_desc *mdesc)
 	empty_zero_page = virt_to_page(zero_page);
 	__flush_dcache_page(NULL, empty_zero_page);
 }
+
+#define __PMD_TYPE_MASK 0x3
+#define __PMD_TYPE_TABLE 0x1
+#define __PMD_TYPE_SECTION 0x2
+#define __PMD_TABLE_MASK 0xFFFFFC00
+#define __PMD_TEX_MASK 0x00007000
+#define __PMD_TEX_SHIFT 12
+#define __PMD_CB_MASK 0x0000000C
+#define __PMD_CB_SHIFT 2
+#define __PTE_TYPE_MASK 0x3
+#define __PTE_TYPE_FAULT 0x0
+#define __PTE_TYPE_LARGE 0x1
+#define __PTE_LARGE_TEX_MASK 0x00007000
+#define __PTE_LARGE_TEX_SHIFT 12
+#define __PTE_CB_MASK 0x0000000C
+#define __PTE_CB_SHIFT 2
+#define __PTE_SMALL_TEX_MASK 0x000001C0
+#define __PTE_SMALL_TEX_SHIFT 6
+#define __IR_NON_CACHEABLE 0
+void __force_clock(u32 l)
+{
+	u32 ttb, nmrr, nmrr_val;
+	volatile u32 *pgd, *pte = 0;
+	int texcb;
+
+	ttb = 0;
+	asm volatile (
+		"mrc p15, 0, %0, c2, c0, 0\n"
+		: "+r"(ttb)
+		:
+		: "cc"
+	);
+	ttb = ttb & ~(0x4000 - 1);
+
+	nmrr = 0;
+	asm volatile (
+		"mrc p15, 0, %0, c10, c2, 1\n"
+		: "+r"(nmrr)
+		:
+		: "cc"
+	);
+
+	pgd = (volatile u32 *)__va(ttb);
+	pgd += (l >> 20);
+	if ((*pgd & __PMD_TYPE_MASK) == __PMD_TYPE_TABLE) {
+		/* page */
+		pte = __va(*pgd & __PMD_TABLE_MASK);
+		pte += (l & ((1 << 20) - 1)) >> 12;
+		if ((*pte & __PTE_TYPE_MASK) == __PTE_TYPE_FAULT) {
+			/* fault */
+			printk(KERN_CRIT "Invalid pte. l = 0x%x, pgd = 0x%x, pte = 0x%x", l, (u32)pgd, (u32)pte);
+			BUG();
+		} else if ((*pte & __PTE_TYPE_MASK) == __PTE_TYPE_LARGE) {
+			/* large page */
+			texcb = (*pte & __PTE_LARGE_TEX_MASK) >> (__PTE_LARGE_TEX_SHIFT);
+			texcb = texcb << 2;
+			texcb = (*pte & __PTE_CB_MASK) >> (__PTE_CB_SHIFT);
+		} else {
+			/* small page */
+			texcb = (*pte & __PTE_SMALL_TEX_MASK) >> (__PTE_SMALL_TEX_SHIFT);
+			texcb = texcb << 2;
+			texcb = (*pte & __PTE_CB_MASK) >> (__PTE_CB_SHIFT);
+		}
+	} else if ((*pgd & __PMD_TYPE_MASK) == __PMD_TYPE_SECTION) {
+		/* section, supersection */
+		texcb = (*pgd & __PMD_TEX_MASK) >> (__PMD_TEX_SHIFT);
+		texcb = texcb << 2;
+		texcb |= (*pgd & __PMD_CB_MASK) >> (__PMD_CB_SHIFT);
+	} else {
+		/* fault */
+		printk(KERN_CRIT "Invalid pte. l = 0x%x, pgd = 0x%x", l, (u32)pgd);
+		BUG();
+	}
+
+	nmrr_val = (nmrr >> (2 * texcb)) & 0x3;
+	if (nmrr_val == __IR_NON_CACHEABLE) {
+		printk(KERN_CRIT "Find a non-cached lock. \
+					l = 0x%x, \
+					pgd = 0x%x, pte = 0x%x, \
+					texcb = 0x%x, nmrr_val = 0x%x", \
+					l, (u32)pgd, (u32)pte, texcb, nmrr_val);
+		BUG();
+	}
+}
+
+EXPORT_SYMBOL(__force_clock);

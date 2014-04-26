@@ -1121,6 +1121,112 @@ out_ro:
 	ubi_ro_mode(ubi);
 	return err;
 }
+/**
+ * ubifs_erase_peb - erase physical eraseblock for mtk.
+ * @ubi: UBI device description object
+ * @wl_wrk: the work object
+ * @cancel: non-zero if the worker has to free memory and exit
+ *
+ * This function erases a physical eraseblock and perform torture testing if
+ * needed. It also takes care about marking the physical eraseblock bad if
+ * needed. Returns zero in case of success and a negative error code in case of
+ * failure.
+ */
+static int ubi_erase_peb(struct ubi_device *ubi, struct ubi_wl_entry *e,
+			  int torture)
+{
+	int pnum = e->pnum, err, need;
+	int retry=0;
+
+retry_erase:
+	retry++;
+	printk("erase PEB %d EC %d round %d\n", pnum, e->ec,retry);
+
+	err = sync_erase(ubi, e, torture);
+	if (!err) {
+		/* Fine, we've erased it successfully */
+		spin_lock(&ubi->wl_lock);
+		wl_tree_add(e, &ubi->free);
+		spin_unlock(&ubi->wl_lock);
+
+		/*
+		 * One more erase operation has happened, take care about
+		 * protected physical eraseblocks.
+		 */
+		serve_prot_queue(ubi);
+
+		/* And take care about wear-leveling */
+		err = ensure_wear_leveling(ubi);
+		return err;
+	}
+
+	ubi_err("failed to erase PEB %d, error %d", pnum, err);
+
+	if (err == -EINTR || err == -ENOMEM || err == -EAGAIN ||
+	    err == -EBUSY) {
+		if(retry < 4){
+			goto retry_erase;
+		}else{
+			goto out_ro;
+		}
+	}
+
+	kmem_cache_free(ubi_wl_entry_slab, e);
+	if (err != -EIO)
+		/*
+		 * If this is not %-EIO, we have no idea what to do. Scheduling
+		 * this physical eraseblock for erasure again would cause
+		 * errors again and again. Well, lets switch to R/O mode.
+		 */
+		goto out_ro;
+
+	/* It is %-EIO, the PEB went bad */
+
+	if (!ubi->bad_allowed) {
+		ubi_err("bad physical eraseblock %d detected", pnum);
+		goto out_ro;
+	}
+
+	spin_lock(&ubi->volumes_lock);
+	need = ubi->beb_rsvd_level - ubi->beb_rsvd_pebs + 1;
+	if (need > 0) {
+		need = ubi->avail_pebs >= need ? need : ubi->avail_pebs;
+		ubi->avail_pebs -= need;
+		ubi->rsvd_pebs += need;
+		ubi->beb_rsvd_pebs += need;
+		if (need > 0)
+			ubi_msg("reserve more %d PEBs", need);
+	}
+
+	if (ubi->beb_rsvd_pebs == 0) {
+		spin_unlock(&ubi->volumes_lock);
+		ubi_err("no reserved physical eraseblocks");
+		goto out_ro;
+	}
+	spin_unlock(&ubi->volumes_lock);
+
+	ubi_msg("mark PEB %d as bad", pnum);
+	err = ubi_io_mark_bad(ubi, pnum);
+	if (err)
+		goto out_ro;
+
+	spin_lock(&ubi->volumes_lock);
+	ubi->beb_rsvd_pebs -= 1;
+	ubi->bad_peb_count += 1;
+	ubi->good_peb_count -= 1;
+	ubi_calculate_reserved(ubi);
+	if (ubi->beb_rsvd_pebs)
+		ubi_msg("%d PEBs left in the reserve", ubi->beb_rsvd_pebs);
+	else
+		ubi_warn("last PEB from the reserved pool was used");
+	spin_unlock(&ubi->volumes_lock);
+
+	return err;
+
+out_ro:
+	ubi_ro_mode(ubi);
+	return err;
+}
 
 /**
  * ubi_wl_put_peb - return a PEB to the wear-leveling sub-system.
@@ -1464,10 +1570,13 @@ int ubi_wl_init_scan(struct ubi_device *ubi, struct ubi_scan_info *si)
 		e->pnum = seb->pnum;
 		e->ec = seb->ec;
 		ubi->lookuptbl[e->pnum] = e;
-		if (schedule_erase(ubi, e, 0)) {
+		//if (schedule_erase(ubi, e, 0)) {
+		if(!ubi->ro_mode){
+			if(ubi_erase_peb(ubi,e,0)){
 			kmem_cache_free(ubi_wl_entry_slab, e);
 			goto out_free;
 		}
+	}
 	}
 
 	list_for_each_entry(seb, &si->free, u.list) {

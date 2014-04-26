@@ -22,31 +22,33 @@
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
+#include <linux/alarmtimer.h>
+#include <linux/wakelock.h>
 #include "android_alarm.h"
+#include <linux/xlog.h>
 
-/* XXX - Hack out wakelocks, while they are out of tree */
-struct wake_lock {
-	int i;
-};
-#define wake_lock(x)
-#define wake_lock_timeout(x, y)
-#define wake_unlock(x)
-#define WAKE_LOCK_SUSPEND 0
-#define wake_lock_init(x, y, z) ((x)->i = 1)
-#define wake_lock_destroy(x)
+#include <mach/mtk_rtc.h>
+#define XLOG_MYTAG	"Power/Alarm"
 
 #define ANDROID_ALARM_PRINT_INFO (1U << 0)
 #define ANDROID_ALARM_PRINT_IO (1U << 1)
 #define ANDROID_ALARM_PRINT_INT (1U << 2)
 
-
-static int debug_mask = ANDROID_ALARM_PRINT_INFO;
+static int debug_mask = ANDROID_ALARM_PRINT_INFO | \
+						ANDROID_ALARM_PRINT_IO | \
+						ANDROID_ALARM_PRINT_INT;
 module_param_named(debug_mask, debug_mask, int, S_IRUGO | S_IWUSR | S_IWGRP);
-
+/*
 #define pr_alarm(debug_level_mask, args...) \
 	do { \
 		if (debug_mask & ANDROID_ALARM_PRINT_##debug_level_mask) { \
 			pr_info(args); \
+		} \
+	} while (0)*/
+#define pr_alarm(debug_level_mask, fmt, args...) \
+	do { \
+		if (debug_mask & ANDROID_ALARM_PRINT_##debug_level_mask) { \
+			xlog_printk(ANDROID_LOG_INFO, XLOG_MYTAG, fmt, ##args); \
 		} \
 	} while (0)
 
@@ -66,7 +68,90 @@ static uint32_t alarm_pending;
 static uint32_t alarm_enabled;
 static uint32_t wait_pending;
 
-static struct android_alarm alarms[ANDROID_ALARM_TYPE_COUNT];
+struct devalarm {
+	union {
+		struct hrtimer hrt;
+		struct alarm alrm;
+	} u;
+	enum android_alarm_type type;
+};
+
+static struct devalarm alarms[ANDROID_ALARM_TYPE_COUNT];
+
+#if 0
+void alarm_set_power_on(struct timespec new_pwron_time, bool logo)
+{
+	unsigned long pwron_time;
+	struct rtc_wkalrm alm;
+	struct rtc_device *alarm_rtc_dev;
+	
+	pr_alarm(INFO, "alarm set power on\n");
+	
+#ifdef RTC_PWRON_SEC
+	/* round down the second */
+	new_pwron_time.tv_sec = (new_pwron_time.tv_sec / 60) * 60;
+#endif
+	if (new_pwron_time.tv_sec > 0) {
+		pwron_time = new_pwron_time.tv_sec;
+#ifdef RTC_PWRON_SEC
+		pwron_time += RTC_PWRON_SEC;
+#endif
+		alm.enabled = (logo ? 3 : 2);
+	} else {
+		pwron_time = 0;
+		alm.enabled = 4;
+	}
+	alarm_rtc_dev = alarmtimer_get_rtcdev();
+	rtc_time_to_tm(pwron_time, &alm.time);
+	
+	rtc_set_alarm_poweron(alarm_rtc_dev, &alm);
+}
+
+void alarm_get_power_on(struct rtc_wkalrm *alm)
+{
+	if (!alm)
+		return;
+
+	memset(alm, 0, sizeof(struct rtc_wkalrm));
+	rtc_read_pwron_alarm(alm);
+}
+#endif
+static int is_wakeup(enum android_alarm_type type)
+{
+	if (type == ANDROID_ALARM_RTC_WAKEUP ||
+			type == ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP)
+		return 1;
+	return 0;
+}
+
+
+static void devalarm_start(struct devalarm *alrm, ktime_t exp)
+{
+	if (is_wakeup(alrm->type))
+		alarm_start(&alrm->u.alrm, exp);
+	else
+		hrtimer_start(&alrm->u.hrt, exp, HRTIMER_MODE_ABS);
+}
+
+
+static int devalarm_try_to_cancel(struct devalarm *alrm)
+{
+	int ret;
+	if (is_wakeup(alrm->type))
+		ret = alarm_try_to_cancel(&alrm->u.alrm);
+	else
+		ret = hrtimer_try_to_cancel(&alrm->u.hrt);
+	return ret;
+}
+
+static void devalarm_cancel(struct devalarm *alrm)
+{
+	if (is_wakeup(alrm->type))
+		alarm_cancel(&alrm->u.alrm);
+	else
+		hrtimer_cancel(&alrm->u.hrt);
+}
+
 
 static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -75,12 +160,24 @@ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct timespec new_alarm_time;
 	struct timespec new_rtc_time;
 	struct timespec tmp_time;
+	struct timespec wall_time;	
+	struct timespec rtc_delta;
+	struct rtc_time new_rtc_tm;
+	struct rtc_time now_rtc_tm;
+	struct rtc_time wall_tm;
+	struct rtc_time alarm_tm;
+	unsigned long  lrtc_current_time;
+	struct rtc_device *rtc_dev;
+	struct rtc_wkalrm pwron_alm;
 	enum android_alarm_type alarm_type = ANDROID_ALARM_IOCTL_TO_TYPE(cmd);
 	uint32_t alarm_type_mask = 1U << alarm_type;
 
-	if (alarm_type >= ANDROID_ALARM_TYPE_COUNT)
+ 	if (alarm_type >= ANDROID_ALARM_TYPE_COUNT &&
+	    alarm_type != ANDROID_ALARM_POWER_ON &&
+	    alarm_type != ANDROID_ALARM_POWER_ON_LOGO) {
 		return -EINVAL;
-
+	}
+	
 	if (ANDROID_ALARM_BASE_CMD(cmd) != ANDROID_ALARM_GET_TIME(0)) {
 		if ((file->f_flags & O_ACCMODE) == O_RDONLY)
 			return -EPERM;
@@ -99,9 +196,16 @@ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	switch (ANDROID_ALARM_BASE_CMD(cmd)) {
 	case ANDROID_ALARM_CLEAR(0):
+		pr_alarm(IO, "alarm %d clear\n", alarm_type);
+		if (alarm_type == ANDROID_ALARM_POWER_ON ||
+			alarm_type == ANDROID_ALARM_POWER_ON_LOGO) {
+			new_alarm_time.tv_sec = 0;
+			alarm_set_power_on(new_alarm_time, false);
+			break;
+		}
 		spin_lock_irqsave(&alarm_slock, flags);
 		pr_alarm(IO, "alarm %d clear\n", alarm_type);
-		android_alarm_try_to_cancel(&alarms[alarm_type]);
+		devalarm_try_to_cancel(&alarms[alarm_type]);
 		if (alarm_pending) {
 			alarm_pending &= ~alarm_type_mask;
 			if (!alarm_pending && !wait_pending)
@@ -128,12 +232,64 @@ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			goto err1;
 		}
 from_old_alarm_set:
-		spin_lock_irqsave(&alarm_slock, flags);
 		pr_alarm(IO, "alarm %d set %ld.%09ld\n", alarm_type,
 			new_alarm_time.tv_sec, new_alarm_time.tv_nsec);
+		
+//		if ((alarm_type == ANDROID_ALARM_POWER_ON)|| (alarm_type == ANDROID_ALARM_POWER_ON_LOGO)) {
+//			rtc_time_to_tm(new_alarm_time.tv_sec, &alarm_tm);
+//			pr_alarm(IO, "alarm set power on - alarm %02d:%02d:%02d %02d/%02d/%04d\n",
+//			alarm_tm.tm_hour, alarm_tm.tm_min,
+//			alarm_tm.tm_sec,  alarm_tm.tm_mon + 1,
+//			alarm_tm.tm_mday,
+//			alarm_tm.tm_year + 1900);
+//	
+//			//toy add for cover system time and HW RTC tick are different
+//			rtc_dev = alarmtimer_get_rtcdev();
+//	
+//			spin_lock_irqsave(&alarm_slock, flags); //avoid get rtc and wall time delay too long
+//			rtc_read_time(rtc_dev, &now_rtc_tm); //get current HW RTC tick
+//			getnstimeofday(&wall_time);         //get android system time
+//			spin_unlock_irqrestore(&alarm_slock, flags);
+//	
+//			pr_alarm(IO, "alarm set power on - rtc %02d:%02d:%02d %02d/%02d/%04d\n",
+//			now_rtc_tm.tm_hour, now_rtc_tm.tm_min,
+//			now_rtc_tm.tm_sec, now_rtc_tm.tm_mon + 1,
+//			now_rtc_tm.tm_mday,
+//			now_rtc_tm.tm_year + 1900);
+//	
+//			rtc_time_to_tm(wall_time.tv_sec, &wall_tm);
+//			pr_alarm(IO, "alarm set power on - wall %02d:%02d:%02d %02d/%02d/%04d\n",
+//			wall_tm.tm_hour, wall_tm.tm_min,
+//			wall_tm.tm_sec, wall_tm.tm_mon + 1,
+//			wall_tm.tm_mday,
+//			wall_tm.tm_year + 1900);
+//			rtc_tm_to_time(&now_rtc_tm, &lrtc_current_time); //transform data type
+//			set_normalized_timespec(&rtc_delta,       //get the delta of system time and HW rtc time
+//					wall_time.tv_sec - lrtc_current_time,
+//					wall_time.tv_nsec);
+//			new_alarm_time.tv_sec = timespec_sub(new_alarm_time, rtc_delta).tv_sec; //compensate the alarm time with the delta.
+//			pr_alarm(IO, "alarm set power on - delta %d\n",rtc_delta.tv_sec);
+//			rtc_time_to_tm(new_alarm_time.tv_sec, &alarm_tm);
+//			pr_alarm(IO, "alarm set power on - new alarm %02d:%02d:%02d %02d/%02d/%04d\n",
+//			alarm_tm.tm_hour, alarm_tm.tm_min,
+//			alarm_tm.tm_sec,  alarm_tm.tm_mon + 1,
+//			alarm_tm.tm_mday,
+//			alarm_tm.tm_year + 1900);
+//		}
+
+
+		if (alarm_type == ANDROID_ALARM_POWER_ON) {
+			alarm_set_power_on(new_alarm_time, false);
+			break;
+		}
+		if (alarm_type == ANDROID_ALARM_POWER_ON_LOGO) {
+			alarm_set_power_on(new_alarm_time, true);
+			break;
+		}
+		spin_lock_irqsave(&alarm_slock, flags);
+	
 		alarm_enabled |= alarm_type_mask;
-		android_alarm_start_range(&alarms[alarm_type],
-			timespec_to_ktime(new_alarm_time),
+		devalarm_start(&alarms[alarm_type],
 			timespec_to_ktime(new_alarm_time));
 		spin_unlock_irqrestore(&alarm_slock, flags);
 		if (ANDROID_ALARM_BASE_CMD(cmd) != ANDROID_ALARM_SET_AND_WAIT(0)
@@ -163,7 +319,25 @@ from_old_alarm_set:
 			rv = -EFAULT;
 			goto err1;
 		}
-		rv = android_alarm_set_rtc(new_rtc_time);
+		rtc_time_to_tm(new_rtc_time.tv_sec, &new_rtc_tm);
+		
+		pr_alarm(IO, "set rtc %ld %ld - rtc %02d:%02d:%02d %02d/%02d/%04d\n",
+		new_rtc_time.tv_sec, new_rtc_time.tv_nsec,
+		new_rtc_tm.tm_hour, new_rtc_tm.tm_min,
+		new_rtc_tm.tm_sec, new_rtc_tm.tm_mon + 1,
+		new_rtc_tm.tm_mday,
+		new_rtc_tm.tm_year + 1900);
+
+		rtc_dev = alarmtimer_get_rtcdev();
+		rv = do_settimeofday(&new_rtc_time);
+		if (rv < 0)
+		{	
+			goto err1;
+		}
+		if (rtc_dev)
+		{
+			rv = rtc_set_time(rtc_dev, &new_rtc_tm);
+		}
 		spin_lock_irqsave(&alarm_slock, flags);
 		alarm_pending |= ANDROID_ALARM_TIME_CHANGE_MASK;
 		wake_up(&alarm_wait_queue);
@@ -179,16 +353,26 @@ from_old_alarm_set:
 			break;
 		case ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP:
 		case ANDROID_ALARM_ELAPSED_REALTIME:
-			tmp_time =
-				ktime_to_timespec(alarm_get_elapsed_realtime());
+			get_monotonic_boottime(&tmp_time);
 			break;
 		case ANDROID_ALARM_TYPE_COUNT:
 		case ANDROID_ALARM_SYSTEMTIME:
 			ktime_get_ts(&tmp_time);
 			break;
+		case ANDROID_ALARM_POWER_ON:
+		case ANDROID_ALARM_POWER_ON_LOGO:
+			break;		
 		}
 		if (copy_to_user((void __user *)arg, &tmp_time,
 		    sizeof(tmp_time))) {
+			rv = -EFAULT;
+			goto err1;
+		}
+		break;
+	case ANDROID_ALARM_GET_POWER_ON:
+		alarm_get_power_on(&pwron_alm);
+		if (copy_to_user((void __user *)arg, &pwron_alm,
+		    sizeof(struct rtc_wkalrm))) {
 			rv = -EFAULT;
 			goto err1;
 		}
@@ -205,6 +389,7 @@ err1:
 static int alarm_open(struct inode *inode, struct file *file)
 {
 	file->private_data = NULL;
+	pr_alarm(INFO, "alarm_open (%d:%d)\n", current->tgid, current->pid);
 	return 0;
 }
 
@@ -224,7 +409,7 @@ static int alarm_release(struct inode *inode, struct file *file)
 				alarm_enabled &= ~alarm_type_mask;
 			}
 			spin_unlock_irqrestore(&alarm_slock, flags);
-			android_alarm_cancel(&alarms[i]);
+			devalarm_cancel(&alarms[i]);
 			spin_lock_irqsave(&alarm_slock, flags);
 		}
 		if (alarm_pending | wait_pending) {
@@ -238,15 +423,19 @@ static int alarm_release(struct inode *inode, struct file *file)
 		alarm_opened = 0;
 	}
 	spin_unlock_irqrestore(&alarm_slock, flags);
+	pr_alarm(INFO, "alarm_release (%d:%d)(%d)\n",
+	current->tgid, current->pid, (int)file->private_data);
 	return 0;
 }
 
-static void alarm_triggered(struct android_alarm *alarm)
+static void devalarm_triggered(struct devalarm *alarm)
 {
 	unsigned long flags;
 	uint32_t alarm_type_mask = 1U << alarm->type;
 
-	pr_alarm(INT, "alarm_triggered type %d\n", alarm->type);
+	//pr_alarm(INT, "devalarm_triggered type %d\n", alarm->type);
+	xlog_printk(ANDROID_LOG_DEBUG, "Power/Alarm", "devalarm_triggered type %d\n", alarm->type);
+	
 	spin_lock_irqsave(&alarm_slock, flags);
 	if (alarm_enabled & alarm_type_mask) {
 		wake_lock_timeout(&alarm_wake_lock, 5 * HZ);
@@ -256,6 +445,31 @@ static void alarm_triggered(struct android_alarm *alarm)
 	}
 	spin_unlock_irqrestore(&alarm_slock, flags);
 }
+
+
+static enum hrtimer_restart devalarm_hrthandler(struct hrtimer *hrt)
+{
+	struct devalarm *devalrm = container_of(hrt, struct devalarm, u.hrt);
+
+	//pr_alarm(INT, "devalarm_hrthandler\n");
+	xlog_printk(ANDROID_LOG_DEBUG, "Power/Alarm", "devalarm_hrthandler\n");
+	
+	devalarm_triggered(devalrm);
+	return HRTIMER_NORESTART;
+}
+
+static enum alarmtimer_restart devalarm_alarmhandler(struct alarm *alrm,
+							ktime_t now)
+{
+	struct devalarm *devalrm = container_of(alrm, struct devalarm, u.alrm);
+
+	//pr_alarm(INT, "devalarm_alarmhandler\n");
+	xlog_printk(ANDROID_LOG_DEBUG, "Power/Alarm", "devalarm_alarmhandler\n");
+	
+	devalarm_triggered(devalrm);
+	return ALARMTIMER_NORESTART;
+}
+
 
 static const struct file_operations alarm_fops = {
 	.owner = THIS_MODULE,
@@ -279,8 +493,23 @@ static int __init alarm_dev_init(void)
 	if (err)
 		return err;
 
-	for (i = 0; i < ANDROID_ALARM_TYPE_COUNT; i++)
-		android_alarm_init(&alarms[i], i, alarm_triggered);
+	alarm_init(&alarms[ANDROID_ALARM_RTC_WAKEUP].u.alrm,
+			ALARM_REALTIME, devalarm_alarmhandler);
+	hrtimer_init(&alarms[ANDROID_ALARM_RTC].u.hrt,
+			CLOCK_REALTIME, HRTIMER_MODE_ABS);
+	alarm_init(&alarms[ANDROID_ALARM_ELAPSED_REALTIME_WAKEUP].u.alrm,
+			ALARM_BOOTTIME, devalarm_alarmhandler);
+	hrtimer_init(&alarms[ANDROID_ALARM_ELAPSED_REALTIME].u.hrt,
+			CLOCK_BOOTTIME, HRTIMER_MODE_ABS);
+	hrtimer_init(&alarms[ANDROID_ALARM_SYSTEMTIME].u.hrt,
+			CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+
+	for (i = 0; i < ANDROID_ALARM_TYPE_COUNT; i++) {
+		alarms[i].type = i;
+		if (!is_wakeup(i))
+			alarms[i].u.hrt.function = devalarm_hrthandler;
+	}
+
 	wake_lock_init(&alarm_wake_lock, WAKE_LOCK_SUSPEND, "alarm");
 
 	return 0;

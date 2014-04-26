@@ -31,14 +31,18 @@
 #include <linux/random.h>
 #include <linux/hw_breakpoint.h>
 #include <linux/cpuidle.h>
+#include <linux/console.h>
 
 #include <asm/cacheflush.h>
-#include <asm/leds.h>
 #include <asm/processor.h>
 #include <asm/thread_notify.h>
 #include <asm/stacktrace.h>
 #include <asm/mach/time.h>
+#include <mach/system.h>
 
+#ifdef CONFIG_MT_LOAD_BALANCE_PROFILER
+#include <mtlbprof/mtlbprof.h>
+#endif
 #ifdef CONFIG_CC_STACKPROTECTOR
 #include <linux/stackprotector.h>
 unsigned long __stack_chk_guard __read_mostly;
@@ -59,6 +63,18 @@ static const char *isa_modes[] = {
 extern void setup_mm_for_reboot(void);
 
 static volatile int hlt_counter;
+
+#ifdef CONFIG_SMP
+void arch_trigger_all_cpu_backtrace(void)
+{
+	smp_send_all_cpu_backtrace();
+}
+#else
+void arch_trigger_all_cpu_backtrace(void)
+{
+	dump_stack();
+}
+#endif
 
 void disable_hlt(void)
 {
@@ -92,6 +108,31 @@ __setup("hlt", hlt_setup);
 extern void call_with_stack(void (*fn)(void *), void *arg, void *sp);
 typedef void (*phys_reset_t)(unsigned long);
 
+#ifdef CONFIG_ARM_FLUSH_CONSOLE_ON_RESTART
+void arm_machine_flush_console(void)
+{
+	printk("\n");
+	pr_emerg("Restarting %s\n", linux_banner);
+	if (console_trylock()) {
+		console_unlock();
+		return;
+	}
+
+	mdelay(50);
+
+	local_irq_disable();
+	if (!console_trylock())
+		pr_emerg("arm_restart: Console was locked! Busting\n");
+	else
+		pr_emerg("arm_restart: Console was locked!\n");
+	console_unlock();
+}
+#else
+void arm_machine_flush_console(void)
+{
+}
+#endif
+
 /*
  * A temporary stack to use for CPU reset. This is static so that we
  * don't clobber it with the identity mapping. When running with this
@@ -100,6 +141,53 @@ typedef void (*phys_reset_t)(unsigned long);
  * code.
  */
 static u64 soft_restart_stack[16];
+
+void arm_machine_restart(char mode, const char *cmd)
+{
+        /* Flush the console to make sure all the relevant messages make it
+         * out to the console drivers */
+        arm_machine_flush_console();
+
+        /* Disable interrupts first */
+        local_irq_disable();
+        local_fiq_disable();
+
+        /*
+         * Tell the mm system that we are going to reboot -
+         * we may need it to insert some 1:1 mappings so that
+         * soft boot works.
+         */
+        setup_mm_for_reboot();
+
+        /* When l1 is disabled and l2 is enabled, the spinlock cannot get the lock,
+         * so we need to disable the l2 as well. by Chia-Hao Hsu
+         */
+        outer_flush_all();
+        outer_disable();
+        outer_flush_all();
+
+        /* Clean and invalidate caches */
+        flush_cache_all();
+
+        /* Turn off caching */
+        cpu_proc_fin();
+
+        /* Push out any further dirty data, and ensure cache is empty */
+        flush_cache_all();
+
+        /*
+         * Now call the architecture specific reboot code.
+         */
+        arch_reset(mode, cmd);
+
+        /*
+         * Whoops - the architecture was unable to reboot.
+         * Tell the user!
+         */
+        mdelay(1000);
+        printk("Reboot failed -- System halted\n");
+        while (1);
+}
 
 static void __soft_restart(void *addr)
 {
@@ -207,15 +295,18 @@ void cpu_idle(void)
 
 	/* endless idle loop with no priority at all */
 	while (1) {
+		idle_notifier_call_chain(IDLE_START);
 		tick_nohz_idle_enter();
 		rcu_idle_enter();
-		leds_event(led_idle_start);
 		while (!need_resched()) {
 #ifdef CONFIG_HOTPLUG_CPU
 			if (cpu_is_offline(smp_processor_id()))
 				cpu_die();
 #endif
 
+#ifdef CONFIG_MT_LOAD_BALANCE_PROFILER
+			mt_lbprof_update_state(smp_processor_id(), MT_LBPROF_IDLE_STATE);
+#endif
 			/*
 			 * We need to disable interrupts here
 			 * to ensure we don't miss a wakeup call.
@@ -237,12 +328,15 @@ void cpu_idle(void)
 				 * return with IRQs enabled.
 				 */
 				WARN_ON(irqs_disabled());
+#ifdef CONFIG_MT_LOAD_BALANCE_PROFILER				
+				mt_lbprof_update_state(smp_processor_id(), MT_LBPROF_NO_TASK_STATE);
+#endif				
 			} else
 				local_irq_enable();
 		}
-		leds_event(led_idle_end);
 		rcu_idle_exit();
 		tick_nohz_idle_exit();
+		idle_notifier_call_chain(IDLE_END);
 		schedule_preempt_disabled();
 	}
 }
@@ -260,7 +354,11 @@ __setup("reboot=", reboot_setup);
 void machine_shutdown(void)
 {
 #ifdef CONFIG_SMP
+    printk("machine_shutdown: start, Proess(%s:%d)\n", current->comm, current->pid);
+    dump_stack();
+    preempt_disable();
 	smp_send_stop();
+    printk("machine_shutdown: done\n");
 #endif
 }
 
@@ -280,6 +378,10 @@ void machine_power_off(void)
 void machine_restart(char *cmd)
 {
 	machine_shutdown();
+    printk("Reboot:machine restart...\n");
+	/* Flush the console to make sure all the relevant messages make it
+	 * out to the console drivers */
+	arm_machine_flush_console();
 
 	arm_pm_restart(reboot_mode, cmd);
 
@@ -289,6 +391,77 @@ void machine_restart(char *cmd)
 	/* Whoops - the platform was unable to reboot. Tell the user! */
 	printk("Reboot failed -- System halted\n");
 	while (1);
+}
+
+/*
+ * dump a block of kernel memory from around the given address
+ */
+static void show_data(unsigned long addr, int nbytes, const char *name)
+{
+	int	i, j;
+	int	nlines;
+	u32	*p;
+
+	/*
+	 * don't attempt to dump non-kernel addresses or
+	 * values that are probably just small negative numbers
+	 */
+	if (addr < PAGE_OFFSET || addr > -256UL)
+		return;
+
+	printk("\n%s: %#lx:\n", name, addr);
+
+	/*
+	 * round address down to a 32 bit boundary
+	 * and always dump a multiple of 32 bytes
+	 */
+	p = (u32 *)(addr & ~(sizeof(u32) - 1));
+	nbytes += (addr & (sizeof(u32) - 1));
+	nlines = (nbytes + 31) / 32;
+
+
+	for (i = 0; i < nlines; i++) {
+		/*
+		 * just display low 16 bits of address to keep
+		 * each line of the dump < 80 characters
+		 */
+		printk("%04lx ", (unsigned long)p & 0xffff);
+		for (j = 0; j < 8; j++) {
+			u32	data;
+			if (probe_kernel_address(p, data)) {
+				printk(" ********");
+			} else {
+				printk(" %08x", data);
+			}
+			++p;
+		}
+		printk("\n");
+	}
+}
+
+static void show_extra_register_data(struct pt_regs *regs, int nbytes)
+{
+	mm_segment_t fs;
+
+	fs = get_fs();
+	set_fs(KERNEL_DS);
+	show_data(regs->ARM_pc - nbytes, nbytes * 2, "PC");
+	show_data(regs->ARM_lr - nbytes, nbytes * 2, "LR");
+	show_data(regs->ARM_sp - nbytes, nbytes * 2, "SP");
+	show_data(regs->ARM_ip - nbytes, nbytes * 2, "IP");
+	show_data(regs->ARM_fp - nbytes, nbytes * 2, "FP");
+	show_data(regs->ARM_r0 - nbytes, nbytes * 2, "R0");
+	show_data(regs->ARM_r1 - nbytes, nbytes * 2, "R1");
+	show_data(regs->ARM_r2 - nbytes, nbytes * 2, "R2");
+	show_data(regs->ARM_r3 - nbytes, nbytes * 2, "R3");
+	show_data(regs->ARM_r4 - nbytes, nbytes * 2, "R4");
+	show_data(regs->ARM_r5 - nbytes, nbytes * 2, "R5");
+	show_data(regs->ARM_r6 - nbytes, nbytes * 2, "R6");
+	show_data(regs->ARM_r7 - nbytes, nbytes * 2, "R7");
+	show_data(regs->ARM_r8 - nbytes, nbytes * 2, "R8");
+	show_data(regs->ARM_r9 - nbytes, nbytes * 2, "R9");
+	show_data(regs->ARM_r10 - nbytes, nbytes * 2, "R10");
+	set_fs(fs);
 }
 
 void __show_regs(struct pt_regs *regs)
@@ -350,6 +523,8 @@ void __show_regs(struct pt_regs *regs)
 		printk("Control: %08x%s\n", ctrl, buf);
 	}
 #endif
+
+	show_extra_register_data(regs, 128);
 }
 
 void show_regs(struct pt_regs * regs)
@@ -509,7 +684,16 @@ unsigned long get_wchan(struct task_struct *p)
 	frame.sp = thread_saved_sp(p);
 	frame.lr = 0;			/* recovered from the stack */
 	frame.pc = thread_saved_pc(p);
+	unsigned long stack_top = frame.sp;
+	unsigned long stack_bottom = ALIGN(stack_top, THREAD_SIZE);
 	do {
+	  if (frame.fp < (stack_top + 4) || frame.fp >= (stack_bottom - 4)) {
+	    /* remove stack dump debug info
+	    show_data(task_thread_info(p), THREAD_SIZE, "Stack");
+	    aee_kernel_warning("Kernel", "Stack corruption");
+	    */
+	    return 0;
+	  }
 		int ret = unwind_frame(&frame);
 		if (ret < 0)
 			return 0;

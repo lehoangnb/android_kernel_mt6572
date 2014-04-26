@@ -106,6 +106,7 @@ unsigned int dirty_expire_interval = 30 * 100; /* centiseconds */
  * Flag that makes the machine dump writes/reads and block dirtyings.
  */
 int block_dump;
+EXPORT_SYMBOL_GPL(block_dump);
 
 /*
  * Flag that puts the machine in "laptop mode". Doubles as a timeout in jiffies:
@@ -178,13 +179,21 @@ static unsigned long highmem_dirtyable_memory(unsigned long total)
 #ifdef CONFIG_HIGHMEM
 	int node;
 	unsigned long x = 0;
+        unsigned long tmp = 0;
 
 	for_each_node_state(node, N_HIGH_MEMORY) {
 		struct zone *z =
 			&NODE_DATA(node)->node_zones[ZONE_HIGHMEM];
 
-		x += zone_page_state(z, NR_FREE_PAGES) +
-		     zone_reclaimable_pages(z) - z->dirty_balance_reserve;
+                // fix overflow issue
+		tmp = zone_page_state(z, NR_FREE_PAGES) +
+		     zone_reclaimable_pages(z);
+                if (tmp > z->dirty_balance_reserve)
+                    x += tmp - z->dirty_balance_reserve;
+                else 
+                    continue;
+		//x += zone_page_state(z, NR_FREE_PAGES) +
+		//     zone_reclaimable_pages(z) - z->dirty_balance_reserve;
 	}
 	/*
 	 * Make sure that the number of highmem pages is never larger
@@ -1935,6 +1944,26 @@ int __set_page_dirty_no_writeback(struct page *page)
  */
 void account_page_dirtied(struct page *page, struct address_space *mapping)
 {
+#ifdef FEATURE_STORAGE_PID_LOGGER
+		struct page_pid_logger *tmp_logger;
+		extern unsigned char *page_logger;
+		extern spinlock_t g_locker;
+		if( page_logger && page) {
+			int page_index;
+	
+			page_index = (unsigned long)((page) - mem_map) ;
+			tmp_logger =((struct page_pid_logger *)page_logger) + page_index;
+			spin_lock(&g_locker);
+			if( page_index < num_physpages) {
+				if( tmp_logger->pid1 == 0XFFFF && tmp_logger->pid2 != current->pid)
+					tmp_logger->pid1 = current->pid;
+				else if( tmp_logger->pid1 != current->pid )
+					tmp_logger->pid2 = current->pid;
+			}
+			spin_unlock(&g_locker);
+			//printk(KERN_INFO"account_page_dirtied pid1:%u pid2:%u pfn:%d \n", tmp_logger->pid1, tmp_logger->pid2, page_index );
+		}
+#endif
 	if (mapping_cap_account_dirty(mapping)) {
 		__inc_zone_page_state(page, NR_FILE_DIRTY);
 		__inc_zone_page_state(page, NR_DIRTIED);

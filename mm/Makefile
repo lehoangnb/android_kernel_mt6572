@@ -2,6 +2,12 @@
 # Makefile for the linux memory manager.
 #
 
+ifeq ($(MTK_INTERNAL), yes)
+ifeq ($(MTK_USE_RESERVED_EXT_MEM), yes)
+#KBUILD_CFLAGS += -DMTK_USE_RESERVED_EXT_MEM
+endif
+endif
+
 mmu-y			:= nommu.o
 mmu-$(CONFIG_MMU)	:= fremap.o highmem.o madvise.o memory.o mincore.o \
 			   mlock.o mmap.o mprotect.o mremap.o msync.o rmap.o \

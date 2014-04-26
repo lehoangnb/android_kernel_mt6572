@@ -27,13 +27,19 @@
 #define PANIC_TIMER_STEP 100
 #define PANIC_BLINK_SPD 18
 
+/* Machine specific panic information string */
+char *mach_panic_string;
+
 int panic_on_oops;
 static unsigned long tainted_mask;
 static int pause_on_oops;
 static int pause_on_oops_flag;
 static DEFINE_SPINLOCK(pause_on_oops_lock);
 
-int panic_timeout;
+#ifndef CONFIG_PANIC_TIMEOUT
+#define CONFIG_PANIC_TIMEOUT 0
+#endif
+int panic_timeout = CONFIG_PANIC_TIMEOUT;
 EXPORT_SYMBOL_GPL(panic_timeout);
 
 ATOMIC_NOTIFIER_HEAD(panic_notifier_list);
@@ -108,14 +114,18 @@ void panic(const char *fmt, ...)
 	 */
 	crash_kexec(NULL);
 
+	kmsg_dump(KMSG_DUMP_PANIC);
+    
+    /*to prevent race condition: multicore stop each other cocurrently
+     */
+    local_irq_disable();
+    
 	/*
 	 * Note smp_send_stop is the usual smp shutdown function, which
 	 * unfortunately means it may not be hardened to work in a panic
 	 * situation.
 	 */
 	smp_send_stop();
-
-	kmsg_dump(KMSG_DUMP_PANIC);
 
 	atomic_notifier_call_chain(&panic_notifier_list, 0, buf);
 
@@ -260,18 +270,12 @@ void add_taint(unsigned flag)
 	 * Also we want to keep up lockdep for staging/out-of-tree
 	 * development and post-warning case.
 	 */
-	switch (flag) {
-	case TAINT_CRAP:
-	case TAINT_OOT_MODULE:
-	case TAINT_WARN:
-	case TAINT_FIRMWARE_WORKAROUND:
-		break;
 
-	default:
-		if (__debug_locks_off())
-			printk(KERN_WARNING "Disabling lock debugging due to kernel taint\n");
-	}
-
+    /* Do not turn off lock debugger. Suppose that we can trust all LKM on eng build */
+	//if (flag != TAINT_CRAP && flag != TAINT_WARN && __debug_locks_off())
+	if (flag != TAINT_CRAP && flag != TAINT_WARN)
+		printk(KERN_WARNING "Kernel Taint Module!!\n");
+    
 	set_bit(flag, &tainted_mask);
 }
 EXPORT_SYMBOL(add_taint);
@@ -375,6 +379,11 @@ late_initcall(init_oops_id);
 void print_oops_end_marker(void)
 {
 	init_oops_id();
+
+	if (mach_panic_string)
+		printk(KERN_WARNING "Board Information: %s\n",
+		       mach_panic_string);
+
 	printk(KERN_WARNING "---[ end trace %016llx ]---\n",
 		(unsigned long long)oops_id);
 }
@@ -457,8 +466,13 @@ EXPORT_SYMBOL(warn_slowpath_null);
  */
 void __stack_chk_fail(void)
 {
+/*
 	panic("stack-protector: Kernel stack is corrupted in: %p\n",
 		__builtin_return_address(0));
+*/
+	printk(KERN_ERR "stack-protector: Kernel stack is corrupted in: %p\n",
+		__builtin_return_address(0));
+    BUG();
 }
 EXPORT_SYMBOL(__stack_chk_fail);
 

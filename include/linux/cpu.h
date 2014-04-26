@@ -18,6 +18,23 @@
 #include <linux/compiler.h>
 #include <linux/cpumask.h>
 
+/*******************************************************************************
+* 20121113 marc.huang                                                          *
+* CPU Hotplug and MCDI integration                                             *
+*******************************************************************************/
+#define MTK_MCDI
+
+#ifdef MTK_MCDI
+
+#include <mach/mt_spm_idle.h>
+
+#ifdef SPM_MCDI_FUNC
+extern atomic_t is_in_hotplug;
+#endif //#ifdef SPM_MCDI_FUNC
+
+#endif //#ifdef MTK_MCDI
+/******************************************************************************/
+
 struct device;
 
 struct cpu {
@@ -211,5 +228,12 @@ extern void enable_nonboot_cpus(void);
 static inline int disable_nonboot_cpus(void) { return 0; }
 static inline void enable_nonboot_cpus(void) {}
 #endif /* !CONFIG_PM_SLEEP_SMP */
+
+#define IDLE_START 1
+#define IDLE_END 2
+
+void idle_notifier_register(struct notifier_block *n);
+void idle_notifier_unregister(struct notifier_block *n);
+void idle_notifier_call_chain(unsigned long val);
 
 #endif /* _LINUX_CPU_H_ */

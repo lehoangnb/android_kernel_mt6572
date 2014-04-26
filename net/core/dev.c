@@ -2091,6 +2091,25 @@ static int dev_gso_segment(struct sk_buff *skb, netdev_features_t features)
 	return 0;
 }
 
+/*
+ * Try to orphan skb early, right before transmission by the device.
+ * We cannot orphan skb if tx timestamp is requested or the sk-reference
+ * is needed on driver level for other reasons, e.g. see net/can/raw.c
+ */
+static inline void skb_orphan_try(struct sk_buff *skb)
+{
+	struct sock *sk = skb->sk;
+
+	if (sk && !skb_shinfo(skb)->tx_flags) {
+		/* skb_tx_hash() wont be able to get sk.
+		 * We copy sk_hash into skb->rxhash
+		 */
+		if (!skb->rxhash)
+			skb->rxhash = sk->sk_hash;
+		skb_orphan(skb);
+	}
+}
+
 static bool can_checksum_protocol(netdev_features_t features, __be16 protocol)
 {
 	return ((features & NETIF_F_GEN_CSUM) ||
@@ -2175,6 +2194,8 @@ int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
 
 		if (!list_empty(&ptype_all))
 			dev_queue_xmit_nit(skb, dev);
+
+		skb_orphan_try(skb);
 
 		features = netif_skb_features(skb);
 
@@ -2285,7 +2306,7 @@ u16 __skb_tx_hash(const struct net_device *dev, const struct sk_buff *skb,
 	if (skb->sk && skb->sk->sk_hash)
 		hash = skb->sk->sk_hash;
 	else
-		hash = (__force u16) skb->protocol;
+		hash = (__force u16) skb->protocol ^ skb->rxhash;
 	hash = jhash_1word(hash, hashrnd);
 
 	return (u16) (((u64) hash * qcount) >> 32) + qoffset;
@@ -2402,6 +2423,7 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
 
 	spin_lock(root_lock);
 	if (unlikely(test_bit(__QDISC_STATE_DEACTIVATED, &q->state))) {
+		printk(KERN_WARNING "[mtk_net]__dev_xmit_skb drop skb_len = %d \n", skb->len);
 		kfree_skb(skb);
 		rc = NET_XMIT_DROP;
 	} else if ((q->flags & TCQ_F_CAN_BYPASS) && !qdisc_qlen(q) &&
@@ -2427,6 +2449,10 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
 
 		rc = NET_XMIT_SUCCESS;
 	} else {
+		if(0 == strncmp(dev->name, "rndis0", 6)){
+		    printk(KERN_INFO "[mtk_net]__dev_xmit_skb flags=%d, qlen=%d, state = %d \n", 
+			        q->flags, qdisc_qlen(q), q->__state);
+    }
 		skb_dst_force(skb);
 		rc = q->enqueue(skb, q) & NET_XMIT_MASK;
 		if (qdisc_run_begin(q)) {
@@ -2507,6 +2533,9 @@ int dev_queue_xmit(struct sk_buff *skb)
 	if (q->enqueue) {
 		rc = __dev_xmit_skb(skb, q, dev, txq);
 		goto out;
+	} else {
+        if(0 == strncmp(dev->name, "rndis0", 6))
+			pr_warn("[mtk_net] rndis no enqueue!\n");
 	}
 
 	/* The device has no queue. Common case for software devices:
@@ -2557,6 +2586,7 @@ recursion_alert:
 
 	rc = -ENETDOWN;
 	rcu_read_unlock_bh();
+	printk(KERN_WARNING "[mtk_net]recursion_alert return: %d, len = %d \n", rc, skb->len);
 
 	kfree_skb(skb);
 	return rc;

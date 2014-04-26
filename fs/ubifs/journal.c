@@ -701,7 +701,8 @@ int ubifs_jnl_write_data(struct ubifs_info *c, const struct inode *inode,
 		(unsigned long)key_inum(c, key), key_block(c, key), len);
 	ubifs_assert(len <= UBIFS_BLOCK_SIZE);
 
-	data = kmalloc(dlen, GFP_NOFS | __GFP_NOWARN);
+	//data = kmalloc(dlen, GFP_NOFS | __GFP_NOWARN);
+	data = NULL;
 	if (!data) {
 		/*
 		 * Fall-back to the write reserve buffer. Note, we might be

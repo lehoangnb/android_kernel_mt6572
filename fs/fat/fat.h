@@ -78,6 +78,7 @@ struct msdos_sb_info {
 	const void *dir_ops;		     /* Opaque; default directory operations */
 	int dir_per_block;	     /* dir entries per block */
 	int dir_per_block_bits;	     /* log2(dir_per_block) */
+	unsigned long vol_id;        /* volume ID */
 
 	int fatent_shift;
 	struct fatent_operations *fatent_ops;
@@ -347,5 +348,17 @@ void fat_cache_destroy(void);
 
 /* helper for printk */
 typedef unsigned long long	llu;
+
+#include <linux/xlog.h>
+#define FAT_TAG "FAT"
+#include <linux/sched.h>
+
+int get_fat_dbg(void) ;
+#define fat_printk(level, tag, fmt, args...) do {\
+      if(get_fat_dbg()) {\
+      	xlog_printk( level, tag, fmt, ##args) ;\
+      }\
+} while(0)
+
 
 #endif /* !_FAT_H */

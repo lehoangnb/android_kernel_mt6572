@@ -30,8 +30,10 @@
 #include <linux/fault-inject.h>
 #include <linux/stacktrace.h>
 #include <linux/prefetch.h>
+#include <linux/aee.h>
 
 #include <trace/events/kmem.h>
+#include <mach/mtk_memcfg.h>
 
 /*
  * Lock order:
@@ -635,6 +637,7 @@ static void object_err(struct kmem_cache *s, struct page *page,
 {
 	slab_bug(s, "%s", reason);
 	print_trailer(s, page, object);
+        aee_kernel_warning("[SLUB_DEBUG]", __FUNCTION__);
 }
 
 static void slab_err(struct kmem_cache *s, struct page *page, char *fmt, ...)
@@ -648,6 +651,7 @@ static void slab_err(struct kmem_cache *s, struct page *page, char *fmt, ...)
 	slab_bug(s, "%s", buf);
 	print_page_info(page);
 	dump_stack();
+        aee_kernel_warning("[SLUB_DEBUG]", __FUNCTION__);
 }
 
 static void init_object(struct kmem_cache *s, void *object, u8 val)
@@ -691,6 +695,10 @@ static int check_bytes_and_report(struct kmem_cache *s, struct page *page,
 	print_trailer(s, page, object);
 
 	restore_bytes(s, what, value, fault, end);
+        printk(KERN_ERR "dump 4k byte in front of the error object\n");
+	print_section("memdump ", (object - PAGE_SIZE), PAGE_SIZE);
+        
+        aee_kernel_warning("[SLUB_DEBUG]", __FUNCTION__);
 	return 0;
 }
 
@@ -760,6 +768,11 @@ static int slab_pad_check(struct kmem_cache *s, struct page *page)
 	int length;
 	int remainder;
 
+#ifdef CONFIG_MTK_MEMCFG
+        if (unlikely(mtk_memcfg_get_bypass_slub_debug_flag())) {
+            return 1;
+        }
+#endif 
 	if (!(s->flags & SLAB_POISON))
 		return 1;
 
@@ -789,6 +802,11 @@ static int check_object(struct kmem_cache *s, struct page *page,
 	u8 *p = object;
 	u8 *endobject = object + s->objsize;
 
+#ifdef CONFIG_MTK_MEMCFG
+        if (unlikely(mtk_memcfg_get_bypass_slub_debug_flag())) {
+            return 1;
+        }
+#endif 
 	if (s->flags & SLAB_RED_ZONE) {
 		if (!check_bytes_and_report(s, page, object, "Redzone",
 			endobject, val, s->inuse - s->objsize))
@@ -1050,6 +1068,11 @@ static void setup_object_debug(struct kmem_cache *s, struct page *page,
 static noinline int alloc_debug_processing(struct kmem_cache *s, struct page *page,
 					void *object, unsigned long addr)
 {
+#ifdef CONFIG_MTK_MEMCFG
+        if (unlikely(mtk_memcfg_get_bypass_slub_debug_flag())) {
+            return 1;
+        }
+#endif 
 	if (!check_slab(s, page))
 		goto bad;
 
@@ -1088,6 +1111,11 @@ static noinline int free_debug_processing(struct kmem_cache *s,
 	unsigned long flags;
 	int rc = 0;
 
+#ifdef CONFIG_MTK_MEMCFG
+        if (unlikely(mtk_memcfg_get_bypass_slub_debug_flag())) {
+            return 1;
+        }
+#endif 
 	local_irq_save(flags);
 	slab_lock(page);
 
@@ -1514,19 +1542,15 @@ static inline void *acquire_slab(struct kmem_cache *s,
 		freelist = page->freelist;
 		counters = page->counters;
 		new.counters = counters;
-		if (mode) {
+		if (mode)
 			new.inuse = page->objects;
-			new.freelist = NULL;
-		} else {
-			new.freelist = freelist;
-		}
 
 		VM_BUG_ON(new.frozen);
 		new.frozen = 1;
 
 	} while (!__cmpxchg_double_slab(s, page,
 			freelist, counters,
-			new.freelist, new.counters,
+			NULL, new.counters,
 			"lock and freeze"));
 
 	remove_partial(n, page);
@@ -1568,6 +1592,7 @@ static void *get_partial_node(struct kmem_cache *s,
 			object = t;
 			available =  page->objects - page->inuse;
 		} else {
+			page->freelist = t;
 			available = put_cpu_partial(s, page, 0);
 			stat(s, CPU_PARTIAL_NODE);
 		}

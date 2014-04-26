@@ -1083,7 +1083,7 @@ static int scan_check_cb(struct ubifs_info *c,
 		}
 	}
 
-	buf = __vmalloc(c->leb_size, GFP_NOFS, PAGE_KERNEL);
+	buf = kmalloc(c->leb_size, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 
@@ -1230,7 +1230,7 @@ static int scan_check_cb(struct ubifs_info *c,
 	}
 
 	ubifs_scan_destroy(sleb);
-	vfree(buf);
+	kfree(buf);
 	return LPT_SCAN_CONTINUE;
 
 out_print:
@@ -1242,7 +1242,7 @@ out_destroy:
 	ubifs_scan_destroy(sleb);
 	ret = -EINVAL;
 out:
-	vfree(buf);
+	kfree(buf);
 	return ret;
 }
 
